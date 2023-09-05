@@ -35,13 +35,13 @@ async function getChargeScriptSha(client: ReturnType<typeof createClient>): Prom
 
     const luaScript = 
 `local initial = redis.call('get', KEYS[1])
-local new = redis.call('incrby', KEYS[1], ARGV[1])
-if new < 0
+local new = initial - ARGV[1]
+if new > 0
 then
-    redis.call('set', KEYS[1], initial)
-    return { "false", initial }
-else
+    redis.call('set', KEYS[1], new)
     return { "true", new }
+else
+    return { "false", initial }
 end`;
 
     const sha = await client.scriptLoad(luaScript);

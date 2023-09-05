@@ -1,5 +1,5 @@
 import express from "express";
-import { createClient } from "redis";
+import { RedisClientType, WatchError, createClient } from "redis";
 import { json } from "body-parser";
 
 const DEFAULT_BALANCE = 100;
@@ -27,17 +27,36 @@ async function reset(account: string): Promise<void> {
     }
 }
 
+async function getChargeScriptSha(client: ReturnType<typeof createClient>): Promise<string> {
+    const cachedSha = await client.get('chargeScriptSha');
+    if (cachedSha) {
+        return cachedSha;
+    }
+
+    const luaScript = 
+`local initial = redis.call('get', KEYS[1])
+local new = initial - ARGV[1]
+if new > 0
+then
+    redis.call('set', KEYS[1], new)
+    return { "true", new }
+else
+    return { "false", initial }
+end`;
+
+    const sha = await client.scriptLoad(luaScript);
+    await client.set('chargeScriptSha', sha);
+    return sha;
+}
+
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
     try {
-        const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
-        if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
-        } else {
-            return { isAuthorized: false, remainingBalance: balance, charges: 0 };
-        }
+        const sha = await getChargeScriptSha(client);
+        const scriptResult = await client.evalSha(sha, { keys: [`${account}/balance`], arguments: [ (-charges).toString() ] });
+        const isAuthorized = ((scriptResult as Array<string>)[0] || 'false') === 'true';
+        const remainingBalance = (scriptResult as Array<string>)[1];
+        return { isAuthorized, remainingBalance: parseInt(remainingBalance), charges: isAuthorized ? charges : 0 };
     } finally {
         await client.disconnect();
     }
@@ -61,7 +80,7 @@ export function buildApp(): express.Application {
         try {
             const account = req.body.account ?? "account";
             const result = await charge(account, req.body.charges ?? 10);
-            console.log(`Successfully charged account ${account}`);
+            console.log(`Successfully charged account ${account}. Response - ${JSON.stringify(result)}`);
             res.status(200).json(result);
         } catch (e) {
             console.error("Error while charging account", e);
